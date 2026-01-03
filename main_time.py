@@ -1,7 +1,8 @@
 import network
 import socket
 import time
-from machine import Pin, I2C
+import gc
+from machine import Pin, I2C, WDT
 import ssd1306
 
 # ============================================================
@@ -19,6 +20,8 @@ TIME_DISPLAY_INTERVAL = 60   # Show time every 60 seconds
 TIME_DISPLAY_DURATION = 5    # Show time for 5 seconds
 REINIT_INTERVAL = 300       # Re-init every 5 minutes
 MIN_STATUS_DISPLAY = 0.25    # Minimum time to show status screens
+GC_INTERVAL = 30             # Garbage collect every 30 seconds
+WATCHDOG_TIMEOUT = 8000      # Watchdog timeout in ms (max 8388ms on RP2040)
 
 # Brightness levels
 BRIGHT = 255
@@ -67,9 +70,11 @@ last_change_time = 0
 last_time_shown = 0
 last_reinit_time = 0
 last_button_time = 0
+last_gc_time = 0
 is_dimmed = False
 showing_time = False
 time_show_start = 0
+wdt = None  # Watchdog timer
 
 # ============================================================
 # DIGIT BITMAPS
@@ -282,6 +287,7 @@ def check_wifi():
 # ============================================================
 def sync_ntp():
     """Sync time from NTP server. Returns True if successful."""
+    sock = None
     try:
         NTP_SERVER = "pool.ntp.org"
         NTP_PORT = 123
@@ -297,7 +303,6 @@ def sync_ntp():
         sock.sendto(ntp_request, ntp_addr)
         
         ntp_response = sock.recv(48)
-        sock.close()
         
         timestamp = int.from_bytes(ntp_response[40:44], 'big')
         unix_timestamp = timestamp - 2208988800
@@ -310,12 +315,19 @@ def sync_ntp():
     except Exception as e:
         print("NTP error:", e)
         return False
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except:
+                pass
 
 # ============================================================
 # SONOS API
 # ============================================================
 def get_volume(ip):
     """Get current volume from Sonos. Returns None on error."""
+    sock = None
     try:
         body = SOAP_VOLUME.format(SERVICE_TYPE)
         request = (
@@ -333,12 +345,17 @@ def get_volume(ip):
         
         data = b""
         sock.settimeout(1)
-        while True:
-            chunk = sock.recv(512)
-            if not chunk:
+        # Limit read attempts to prevent infinite loop
+        for _ in range(20):
+            try:
+                chunk = sock.recv(512)
+                if not chunk:
+                    break
+                data += chunk
+                if b"</s:Envelope>" in data:
+                    break
+            except:
                 break
-            data += chunk
-        sock.close()
         
         text = data.decode("utf-8", "ignore")
         start = text.find("<CurrentVolume>")
@@ -350,9 +367,16 @@ def get_volume(ip):
     except Exception as e:
         print("Volume error:", e)
         return None
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except:
+                pass
 
 def get_mute(ip):
     """Get mute state from Sonos. Returns False on error."""
+    sock = None
     try:
         body = SOAP_MUTE.format(SERVICE_TYPE)
         request = (
@@ -370,12 +394,17 @@ def get_mute(ip):
         
         data = b""
         sock.settimeout(1)
-        while True:
-            chunk = sock.recv(512)
-            if not chunk:
+        # Limit read attempts to prevent infinite loop
+        for _ in range(20):
+            try:
+                chunk = sock.recv(512)
+                if not chunk:
+                    break
+                data += chunk
+                if b"</s:Envelope>" in data:
+                    break
+            except:
                 break
-            data += chunk
-        sock.close()
         
         text = data.decode("utf-8", "ignore")
         start = text.find("<CurrentMute>")
@@ -386,6 +415,12 @@ def get_mute(ip):
     except Exception as e:
         print("Mute error:", e)
         return False
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except:
+                pass
 
 # ============================================================
 # INIT / REINIT
@@ -444,6 +479,7 @@ def init_system():
 def main():
     global last_vol, last_mute, last_change_time, last_time_shown
     global last_reinit_time, is_dimmed, showing_time, time_show_start
+    global last_gc_time, wdt
     
     # Initial setup
     set_bright()
@@ -452,6 +488,18 @@ def main():
     while not init_system():
         print("Init failed, retrying in 5 seconds...")
         time.sleep(5)
+    
+    # Initialize watchdog timer - will reset device if not fed
+    try:
+        wdt = WDT(timeout=WATCHDOG_TIMEOUT)
+        print("Watchdog enabled")
+    except Exception as e:
+        print("Watchdog not available:", e)
+        wdt = None
+    
+    # Initial garbage collection
+    gc.collect()
+    last_gc_time = time.time()
     
     # Get initial volume and show it
     vol = get_volume(SONOS_IP)
@@ -476,6 +524,15 @@ def main():
     # Main loop
     while True:
         now = time.time()
+        
+        # Feed the watchdog to prevent reset
+        if wdt:
+            wdt.feed()
+        
+        # Periodic garbage collection
+        if (now - last_gc_time) > GC_INTERVAL:
+            gc.collect()
+            last_gc_time = now
         
         # Check for button press - triggers reinit
         if check_button():
